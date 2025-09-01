@@ -14,7 +14,9 @@ const config = createConfig(
   getDefaultConfig({
     chains: [sepolia],
     transports: {
-      [sepolia.id]: http("https://1rpc.io/sepolia"),
+      [sepolia.id]: http(
+        "https://sepolia.infura.io/v3/637b17f210ff40eba3121315f234127b"
+      ),
     },
 
     walletConnectProjectId: process.env.NEXT_PUBLIC_PROJECT_ID as string,

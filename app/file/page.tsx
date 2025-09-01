@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
 import {
   useAccount,
@@ -10,7 +10,14 @@ import {
   useWaitForTransactionReceipt,
   useReadContract,
 } from "wagmi";
-import { keccak256, stringToBytes, bytesToHex, pad } from "viem";
+import {
+  keccak256,
+  stringToBytes,
+  bytesToHex,
+  pad,
+  verifyTypedData,
+  Hex,
+} from "viem";
 import { ABI } from "../components/contract";
 import useContractAddress from "../hooks/useContractAddress";
 import {
@@ -18,6 +25,7 @@ import {
   Copy,
   Download,
   FileUp,
+  FileQuestion,
   Search,
   ShieldCheck,
   TriangleAlert,
@@ -56,10 +64,6 @@ function clsx(...xs: Array<string | false | undefined>) {
   return xs.filter(Boolean).join(" ");
 }
 
-function shorten(addr?: string | null) {
-  return addr ? `${addr.slice(0, 6)}...${addr.slice(-4)}` : "Not connected";
-}
-
 /** human-readable bytes */
 function prettyBytes(bn?: bigint | number | null) {
   if (bn === undefined || bn === null) return "-";
@@ -74,30 +78,57 @@ function prettyBytes(bn?: bigint | number | null) {
   return `${v.toFixed(2)} ${units[i]}`;
 }
 
-/** Normalize to bytes32 */
+/** Make sure we always pass exactly bytes32.
+ *  - If plain text → keccak256(string)
+ *  - If hex:
+ *      * fix odd nibble by left-padding a "0"
+ *      * if > 32 bytes → keccak256(hex) (compress)
+ *      * if < 32 bytes → left-pad to 32 bytes
+ *      * if = 32 bytes → use as-is
+ */
 function ensureBytes32(input: string): Hex32 {
   if (!input) return ZERO32;
 
   if (input.startsWith("0x")) {
     let hex = input as `0x${string}`;
-    if ((hex.length - 2) % 2 !== 0) hex = `0x0${hex.slice(2)}` as `0x${string}`;
+    // normalize to even length ("0x1" -> "0x01")
+    if ((hex.length - 2) % 2 !== 0) {
+      hex = `0x0${hex.slice(2)}` as `0x${string}`;
+    }
     const byteLen = (hex.length - 2) / 2;
     if (byteLen === 32) return hex as Hex32;
-    if (byteLen > 32) return keccak256(hex) as Hex32;
+    if (byteLen > 32) {
+      // too long: compress deterministically
+      return keccak256(hex) as Hex32;
+    }
+    // short: left-pad to 32
     return pad(hex, { size: 32, dir: "left" }) as Hex32;
   }
+
+  // plain text → hash
   return keccak256(stringToBytes(input)) as Hex32;
 }
 
 // WebCrypto SHA-256 (returns bytes32 hex)
 async function sha256HexFile(file: File): Promise<Hex32> {
   const buf = await file.arrayBuffer();
-  const hash = await crypto.subtle.digest("SHA-256", buf);
-  return bytesToHex(new Uint8Array(hash)) as Hex32;
+  return await sha256HexArrayBuffer(buf);
 }
+
 async function sha256HexArrayBuffer(buf: ArrayBuffer): Promise<Hex32> {
-  const hash = await crypto.subtle.digest("SHA-256", buf);
-  return bytesToHex(new Uint8Array(hash)) as Hex32;
+  // Check if crypto.subtle is available (browser + HTTPS)
+  if (typeof window === "undefined" || !window.crypto?.subtle) {
+    throw new Error(
+      "crypto.subtle is not available. Make sure you're using HTTPS or localhost."
+    );
+  }
+
+  try {
+    const hash = await crypto.subtle.digest("SHA-256", buf);
+    return bytesToHex(new Uint8Array(hash)) as Hex32;
+  } catch (error) {
+    throw new Error(`Failed to compute SHA-256 hash: ${error}`);
+  }
 }
 
 function Copyable({ text, className }: { text: string; className?: string }) {
@@ -152,116 +183,6 @@ function Badge({
 }
 
 /* ─────────────────────────────────────────────
-   Navbar
-   ───────────────────────────────────────────── */
-function Navbar({
-  tab,
-  setTab,
-}: {
-  tab: "upload" | "retrieve" | "verify";
-  setTab: (t: "upload" | "retrieve" | "verify") => void;
-}) {
-  const { address, chain } = useAccount();
-
-  const NavButton = ({
-    id,
-    label,
-    activeClass,
-  }: {
-    id: "upload" | "retrieve" | "verify";
-    label: string;
-    activeClass: string;
-  }) => (
-    <button
-      onClick={() => setTab(id)}
-      className={clsx(
-        "px-3 py-1.5 rounded-lg text-sm font-medium transition",
-        tab === id
-          ? activeClass
-          : "text-gray-300 hover:text-white hover:bg-gray-800/70"
-      )}
-      type="button"
-    >
-      {label}
-    </button>
-  );
-
-  return (
-    <header className="sticky top-0 z-50 border-b border-white/10 bg-gray-950/65 backdrop-blur-xl supports-[backdrop-filter]:bg-gray-950/55">
-      <div className="max-w-5xl mx-auto px-4">
-        <div className="h-14 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-2">
-            <div className="text-lg font-extrabold tracking-tight text-gray-100">
-              File<span className="text-purple-400">Registry</span>
-            </div>
-            <span className="hidden md:inline text-[11px] text-gray-400">
-              IPFS • EIP-712 • On-chain proofs
-            </span>
-          </div>
-
-          <nav className="hidden sm:flex items-center gap-1">
-            <NavButton
-              id="upload"
-              label="Upload & Register"
-              activeClass="bg-purple-600 text-white"
-            />
-            <NavButton
-              id="retrieve"
-              label="Retrieve & Download"
-              activeClass="bg-sky-600 text-white"
-            />
-            <NavButton
-              id="verify"
-              label="Verify"
-              activeClass="bg-emerald-600 text-white"
-            />
-          </nav>
-
-          <div className="flex items-center gap-2">
-            <div className="hidden md:flex items-center gap-2 text-[11px] text-gray-400">
-              <span>Chain</span>
-              <span className="px-2 py-0.5 rounded bg-gray-800 text-gray-200 border border-gray-700">
-                {chain?.id ?? "—"}
-              </span>
-            </div>
-            <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-full border border-gray-700 bg-gray-800/80 text-xs text-gray-200">
-              <span
-                className={clsx(
-                  "inline-block w-2 h-2 rounded-full",
-                  address ? "bg-emerald-500" : "bg-rose-500"
-                )}
-              />
-              <span className="font-mono">{shorten(address)}</span>
-            </div>
-          </div>
-        </div>
-
-        {/* Mobile nav */}
-        <div className="sm:hidden pb-2">
-          <div className="flex gap-2 overflow-x-auto">
-            <NavButton
-              id="upload"
-              label="Upload"
-              activeClass="bg-purple-600 text-white"
-            />
-            <NavButton
-              id="retrieve"
-              label="Retrieve"
-              activeClass="bg-sky-600 text-white"
-            />
-            <NavButton
-              id="verify"
-              label="Verify"
-              activeClass="bg-emerald-600 text-white"
-            />
-          </div>
-        </div>
-      </div>
-    </header>
-  );
-}
-
-/* ─────────────────────────────────────────────
    Latest viewer (guarded: avoids revert on empty)
    ───────────────────────────────────────────── */
 function Latest({ fileId }: { fileId: Hex32 }) {
@@ -307,15 +228,13 @@ function Latest({ fileId }: { fileId: Hex32 }) {
       {loadingCount && <div>Loading…</div>}
       {countErr && (
         <div className="text-rose-400">
-          {String((countErr as any).message || countErr)}
+          {String(countErr.message || countErr)}
         </div>
       )}
       {!enabled && !loadingCount && <div>No versions yet.</div>}
       {enabled && isLoading && <div>Loading latest…</div>}
       {enabled && error && (
-        <div className="text-rose-400">
-          {String((error as any).message || error)}
-        </div>
+        <div className="text-rose-400">{String(error.message || error)}</div>
       )}
 
       {enabled && !!data && (
@@ -422,11 +341,20 @@ function UploadPanel() {
           `No contract mapped for chain ${chain?.id ?? "unknown"}`
         );
 
+      // Check crypto.subtle availability early
+      if (typeof window === "undefined" || !window.crypto?.subtle) {
+        throw new Error(
+          "crypto.subtle is not available. Please use HTTPS or localhost."
+        );
+      }
+
+      // Verify contract code at address on current chain
       const code = await publicClient.getCode({ address: contractAddress });
-      if (!code || code === "0x")
+      if (!code || code === "0x") {
         throw new Error(
           `No contract code at ${contractAddress} on chain ${chain?.id}. Switch to the correct network or update CONTRACTS.`
         );
+      }
 
       if (
         !process.env.NEXT_PUBLIC_PINATA_API_KEY ||
@@ -455,10 +383,10 @@ function UploadPanel() {
       setFileUrl(url);
 
       // 2) File digest & size
-      const digest = await sha256HexFile(file);
+      const digest = await sha256HexFile(file); // always 32 bytes
       const size = BigInt(file.size);
 
-      // 3) Nonce
+      // 3) Nonce (from same contract)
       const nonce = (await publicClient.readContract({
         address: contractAddress,
         abi: ABI,
@@ -466,11 +394,11 @@ function UploadPanel() {
         args: [account],
       })) as bigint;
 
-      // 4) Timestamp / chain
+      // 4) Timestamp (unix seconds)
       const fileTimestamp = BigInt(Math.floor(Date.now() / 1000));
       const chainId = chain?.id ?? (await publicClient.getChainId());
 
-      // 5) EIP-712 sign
+      // 5) EIP-712 sign (verifyingContract MUST match write address)
       const signature = await wallet.signTypedData({
         account,
         domain: {
@@ -482,15 +410,15 @@ function UploadPanel() {
         types: FILE_PROOF_TYPES,
         primaryType: "FileProof",
         message: {
-          fileId,
-          digest,
-          uri: url,
-          size,
-          privacyMode,
-          prevDigest,
-          fileTimestamp,
-          nonce,
-          deptId,
+          fileId, // bytes32 (normalized)
+          digest, // bytes32 (sha256 file)
+          uri: url, // string
+          size, // uint256
+          privacyMode, // uint8
+          prevDigest, // bytes32 (normalized)
+          fileTimestamp, // uint64
+          nonce, // uint256
+          deptId, // bytes32 (normalized)
         },
       });
 
@@ -510,15 +438,17 @@ function UploadPanel() {
           deptId,
           signature as `0x${string}`,
         ],
-        account,
+        account, // explicit
       });
 
-      // Save URL locally
+      // Persist URL locally for retrieval + verification UX (client-side only)
       try {
-        const key = `fileregistry:urls`;
-        const existing = JSON.parse(localStorage.getItem(key) || "{}");
-        existing[String(fileId)] = url;
-        localStorage.setItem(key, JSON.stringify(existing));
+        if (typeof window !== "undefined") {
+          const key = `fileregistry:urls`;
+          const existing = JSON.parse(localStorage.getItem(key) || "{}");
+          existing[String(fileId)] = url;
+          localStorage.setItem(key, JSON.stringify(existing));
+        }
       } catch {}
     } catch (err) {
       console.error(err);
@@ -532,12 +462,18 @@ function UploadPanel() {
         <FileUp size={18} /> Upload & Register
       </h3>
 
+      {/* Connection status */}
       <div className="mb-4 p-3 bg-gray-800 rounded-lg text-sm">
         <div className="text-gray-300">Connection Status:</div>
-        <div className="text-xs mt-1">Account: {shorten(account)}</div>
+        <div className="text-xs mt-1">
+          Account:{" "}
+          {account
+            ? `${account.slice(0, 6)}...${account.slice(-4)}`
+            : "Not connected"}
+        </div>
         <div className="text-xs">
-          Wallet: {Boolean(wallet) ? "✅" : "❌"} | Public Client:{" "}
-          {Boolean(usePublicClient) ? "✅" : "❌"}
+          Wallet: {wallet ? "✅" : "❌"} | Public Client:{" "}
+          {publicClient ? "✅" : "❌"}
         </div>
         <div className="text-xs">
           Contract: <span className="break-all">{contractAddress}</span>
@@ -546,6 +482,7 @@ function UploadPanel() {
       </div>
 
       <form className="flex flex-col gap-4" onSubmit={handleSubmit}>
+        {/* file picker */}
         <label className="flex flex-col items-center justify-center border-2 border-dashed border-purple-300 rounded-lg p-6 cursor-pointer hover:border-purple-500 transition">
           <span className="text-purple-400 font-medium mb-2">
             Choose a file
@@ -560,6 +497,7 @@ function UploadPanel() {
           )}
         </label>
 
+        {/* File ID */}
         <div className="grid gap-1">
           <label className="text-sm text-gray-300">
             File ID (bytes32 or text)
@@ -571,12 +509,13 @@ function UploadPanel() {
             placeholder="file-001 or 0x..."
             spellCheck={false}
           />
-        </div>
-        <div className="text-[11px] text-gray-500 flex items-center gap-2">
-          Resolved: <span className="break-all">{fileId}</span>{" "}
-          <Copyable text={fileId} />
+          <div className="text-[11px] text-gray-500 flex items-center gap-2">
+            Resolved: <span className="break-all">{fileId}</span>{" "}
+            <Copyable text={fileId} />
+          </div>
         </div>
 
+        {/* Department */}
         <div className="grid gap-1">
           <label className="text-sm text-gray-300">
             Department (bytes32 or text)
@@ -588,9 +527,10 @@ function UploadPanel() {
             placeholder="dept-A"
             spellCheck={false}
           />
+          <div className="text-[11px] text-gray-500">Resolved: {deptId}</div>
         </div>
-        <div className="text-[11px] text-gray-500">Resolved: {deptId}</div>
 
+        {/* Prev digest */}
         <div className="grid gap-1">
           <label className="text-sm text-gray-300">
             Previous Digest (0x0 for first)
@@ -602,9 +542,12 @@ function UploadPanel() {
             placeholder="0x0 or 0x…"
             spellCheck={false}
           />
+          <div className="text-[11px] text-gray-500">
+            Resolved: {prevDigest}
+          </div>
         </div>
-        <div className="text-[11px] text-gray-500">Resolved: {prevDigest}</div>
 
+        {/* Privacy Mode */}
         <div className="grid gap-1">
           <label className="text-sm text-gray-300">Privacy Mode (0,1,2)</label>
           <input
@@ -650,11 +593,10 @@ function UploadPanel() {
         {isConfirmed && (
           <div className="text-sm text-green-400">Confirmed ✅</div>
         )}
-        {error && (
-          <div className="text-sm text-rose-400">{(error as any).message}</div>
-        )}
+        {error && <div className="text-sm text-rose-400">{error.message}</div>}
       </form>
 
+      {/* Latest quick view */}
       <Latest fileId={fileId} />
     </div>
   );
@@ -669,12 +611,18 @@ function RetrievePanel() {
   const [fileId, setFileId] = useState<Hex32>(ensureBytes32("file-001"));
   const [knownUrl, setKnownUrl] = useState<string>("");
 
+  // Load any remembered URL for this fileId (client-side only)
   useEffect(() => {
+    if (typeof window === "undefined") return;
+
     try {
       const db = JSON.parse(localStorage.getItem("fileregistry:urls") || "{}");
       const url = db[String(fileId)];
       if (typeof url === "string") setKnownUrl(url);
-    } catch {}
+      else setKnownUrl("");
+    } catch {
+      setKnownUrl("");
+    }
   }, [fileId]);
 
   const { data: count } = useReadContract({
@@ -685,13 +633,15 @@ function RetrievePanel() {
   });
 
   const enabled = (typeof count === "bigint" ? count : BigInt(0)) > BigInt(0);
-  const { data, isLoading, error } = useReadContract({
+  const { data, isLoading, error, refetch } = useReadContract({
     address: contractAddress,
     abi: ABI,
     functionName: "latest",
     args: [fileId],
     query: { enabled },
   });
+
+  const v: any = data || {};
 
   return (
     <div className="bg-gray-900 rounded-xl shadow-lg p-6 w-full border border-gray-800">
@@ -710,7 +660,7 @@ function RetrievePanel() {
             spellCheck={false}
           />
           <div className="text-[11px] text-gray-500 break-all">
-            Resolved: {fileId as string}
+            Resolved: {fileId}
           </div>
         </div>
         <button
@@ -725,7 +675,7 @@ function RetrievePanel() {
         {isLoading && <div className="text-sm">Loading latest…</div>}
         {error && (
           <div className="text-sm text-rose-400">
-            {String((error as any).message || error)}
+            {String(error.message || error)}
           </div>
         )}
         {!enabled && (
@@ -737,47 +687,31 @@ function RetrievePanel() {
         {enabled && !!data && (
           <div className="rounded-lg border border-gray-800 bg-gray-950 p-4 text-xs text-gray-200">
             <div className="font-semibold mb-2">Latest Metadata</div>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 items-start gap-3">
-              <div className="min-w-0 md:col-span-2">
-                <div className="text-gray-400">digest</div>
-                <div className="font-mono break-all">
-                  {String((data as any).digest)}
-                </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-y-1 gap-x-6">
+              <div>
+                <span className="text-gray-400">digest:</span>{" "}
+                {String((data as any).digest)}
               </div>
-
-              <div className="min-w-0 md:col-span-2">
-                <div className="text-gray-400">prevDigest</div>
-                <div className="font-mono break-all">
-                  {String((data as any).prevDigest)}
-                </div>
+              <div>
+                <span className="text-gray-400">prevDigest:</span>{" "}
+                {String((data as any).prevDigest)}
               </div>
-
-              <div className="min-w-0">
-                <div className="text-gray-400">uriHash</div>
-                <div className="font-mono break-all">
-                  {String((data as any).uriHash)}
-                </div>
+              <div>
+                <span className="text-gray-400">uriHash:</span>{" "}
+                {String((data as any).uriHash)}
               </div>
-
-              <div className="min-w-0">
-                <div className="text-gray-400">size</div>
-                <div>
-                  {String((data as any).size?.toString?.())} (
-                  {prettyBytes((data as any).size)})
-                </div>
+              <div>
+                <span className="text-gray-400">size:</span>{" "}
+                {String((data as any).size?.toString?.())} (
+                {prettyBytes((data as any).size)})
               </div>
-
-              <div className="min-w-0">
-                <div className="text-gray-400">privacyMode</div>
-                <div>{String((data as any).privacyMode)}</div>
+              <div>
+                <span className="text-gray-400">privacyMode:</span>{" "}
+                {String((data as any).privacyMode)}
               </div>
-
-              <div className="min-w-0">
-                <div className="text-gray-400">signer</div>
-                <div className="font-mono break-all">
-                  {String((data as any).signer)}
-                </div>
+              <div>
+                <span className="text-gray-400">signer:</span>{" "}
+                {String((data as any).signer)}
               </div>
             </div>
 
@@ -818,9 +752,12 @@ function RetrievePanel() {
 
 /* ─────────────────────────────────────────────
    Verify Panel (Integrity & Binding)
+   - Compares local/remote file → on-chain latest
+   - Verifies: digest, size, uriHash
    ───────────────────────────────────────────── */
 function VerifyPanel() {
   const contractAddress = useContractAddress();
+  const publicClient = usePublicClient();
 
   const [query, setQuery] = useState<string>("file-001");
   const [fileId, setFileId] = useState<Hex32>(ensureBytes32("file-001"));
@@ -854,11 +791,17 @@ function VerifyPanel() {
   const v: any = data || {};
 
   useEffect(() => {
+    // try load remembered URL for convenience (client-side only)
+    if (typeof window === "undefined") return;
+
     try {
       const db = JSON.parse(localStorage.getItem("fileregistry:urls") || "{}");
       const url = db[String(fileId)];
       if (typeof url === "string") setRemoteUrl(url);
-    } catch {}
+      else setRemoteUrl("");
+    } catch {
+      setRemoteUrl("");
+    }
   }, [fileId]);
 
   async function runChecks() {
@@ -871,6 +814,13 @@ function VerifyPanel() {
     try {
       if (!enabled || !data)
         throw new Error("No on-chain version for this File ID");
+
+      // Check crypto.subtle availability
+      if (typeof window === "undefined" || !window.crypto?.subtle) {
+        throw new Error(
+          "crypto.subtle is not available. Please use HTTPS or localhost."
+        );
+      }
 
       let buf: ArrayBuffer;
       let fileSize: bigint;
@@ -889,14 +839,17 @@ function VerifyPanel() {
         fileSize = BigInt(blob.size);
       }
 
+      // (1) Check size
       const sizeMatch = fileSize === (v.size as bigint);
       setSizeOk(sizeMatch);
 
+      // (2) Check digest
       const digest = await sha256HexArrayBuffer(buf);
       const digestMatch =
         digest.toLowerCase() === String(v.digest).toLowerCase();
       setDigestOk(digestMatch);
 
+      // (3) Check uriHash binding (requires URL)
       if (source === "remote" && remoteUrl) {
         const uhash = keccak256(stringToBytes(remoteUrl));
         const uriMatch =
@@ -944,14 +897,14 @@ function VerifyPanel() {
             spellCheck={false}
           />
           <div className="text-[11px] text-gray-500 break-all">
-            Resolved: {fileId as string}
+            Resolved: {fileId}
           </div>
         </div>
         <button
           className="h-10 px-4 rounded bg-gray-800 hover:bg-gray-700 text-gray-100"
           onClick={() => setFileId(ensureBytes32(query))}
         >
-          Load On-chain Latest
+          Load On‑chain Latest
         </button>
       </div>
 
@@ -962,24 +915,30 @@ function VerifyPanel() {
           </div>
         )}
         {enabled && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div className="min-w-0">
-              <div className="text-gray-400">digest</div>
-              <div className="font-mono break-all">{String(v.digest)}</div>
-            </div>
-            <div className="min-w-0">
-              <div className="text-gray-400">uriHash</div>
-              <div className="font-mono break-all">{String(v.uriHash)}</div>
-            </div>
-            <div className="min-w-0">
-              <div className="text-gray-400">size</div>
-              <div>
-                {String(v.size?.toString?.())} ({prettyBytes(v.size)})
+          <div className="space-y-3">
+            <div className="space-y-1">
+              <div className="text-gray-400 text-xs font-medium">Digest:</div>
+              <div className="font-mono text-gray-200 break-all text-xs bg-gray-900 p-2 rounded border border-gray-800">
+                {String(v.digest)}
               </div>
             </div>
-            <div className="min-w-0">
-              <div className="text-gray-400">signer</div>
-              <div className="font-mono break-all">{String(v.signer)}</div>
+            <div className="space-y-1">
+              <div className="text-gray-400 text-xs font-medium">URI Hash:</div>
+              <div className="font-mono text-gray-200 break-all text-xs bg-gray-900 p-2 rounded border border-gray-800">
+                {String(v.uriHash)}
+              </div>
+            </div>
+            <div className="space-y-1">
+              <div className="text-gray-400 text-xs font-medium">Size:</div>
+              <div className="text-gray-200 text-xs">
+                {String(v.size?.toString?.())} bytes ({prettyBytes(v.size)})
+              </div>
+            </div>
+            <div className="space-y-1">
+              <div className="text-gray-400 text-xs font-medium">Signer:</div>
+              <div className="font-mono text-gray-200 break-all text-xs bg-gray-900 p-2 rounded border border-gray-800">
+                {String(v.signer)}
+              </div>
             </div>
           </div>
         )}
@@ -1068,65 +1027,98 @@ function VerifyPanel() {
 }
 
 /* ─────────────────────────────────────────────
-   Top-level Page with Navbar + Tabs
+   Top-level Page with Tabs
    ───────────────────────────────────────────── */
 export default function FileRegistryUI() {
   const [tab, setTab] = useState<"upload" | "retrieve" | "verify">("upload");
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-950">
-      <Navbar tab={tab} setTab={setTab} />
+    <div className="min-h-screen flex flex-col items-center justify-start bg-gradient-to-br from-gray-900 via-gray-800 to-gray-950 py-10 px-4">
+      <h1 className="text-3xl font-extrabold text-center mb-2 text-gray-100">
+        File transfer using{" "}
+        <span className="bg-gradient-to-r from-purple-400 via-pink-400 to-blue-400 bg-clip-text text-transparent uppercase tracking-widest drop-shadow">
+          BLOCKCHAIN
+        </span>
+      </h1>
+      <p className="text-gray-400 text-sm mb-6 text-center max-w-2xl">
+        Upload to IPFS, register on-chain with EIP‑712, retrieve metadata, and
+        verify integrity.
+      </p>
 
-      <main className="flex flex-col items-center justify-start pt-6 pb-12 px-4">
-        <h1 className="text-3xl font-extrabold text-center mb-2 text-gray-100">
-          File transfer using{" "}
-          <span className="bg-gradient-to-r from-purple-400 via-pink-400 to-blue-400 bg-clip-text text-transparent uppercase tracking-widest drop-shadow">
-            BLOCKCHAIN
-          </span>
-        </h1>
-        <p className="text-gray-400 text-sm mb-6 text-center max-w-2xl">
-          Upload to IPFS, register on-chain with EIP-712, retrieve metadata, and
-          verify integrity.
-        </p>
+      {/* Tabs */}
+      <div className="flex gap-2 mb-6">
+        <button
+          className={clsx(
+            "px-4 py-2 rounded-lg font-medium",
+            tab === "upload"
+              ? "bg-purple-600 text-white"
+              : "bg-gray-800 text-gray-200 hover:bg-gray-700"
+          )}
+          onClick={() => setTab("upload")}
+        >
+          Upload & Register
+        </button>
+        <button
+          className={clsx(
+            "px-4 py-2 rounded-lg font-medium",
+            tab === "retrieve"
+              ? "bg-sky-600 text-white"
+              : "bg-gray-800 text-gray-200 hover:bg-gray-700"
+          )}
+          onClick={() => setTab("retrieve")}
+        >
+          Retrieve & Download
+        </button>
+        <button
+          className={clsx(
+            "px-4 py-2 rounded-lg font-medium",
+            tab === "verify"
+              ? "bg-emerald-600 text-white"
+              : "bg-gray-800 text-gray-200 hover:bg-gray-700"
+          )}
+          onClick={() => setTab("verify")}
+        >
+          Verify
+        </button>
+      </div>
 
-        <div className="w-full max-w-3xl">
-          {tab === "upload" && <UploadPanel />}
-          {tab === "retrieve" && <RetrievePanel />}
-          {tab === "verify" && <VerifyPanel />}
-        </div>
+      <div className="w-full max-w-3xl">
+        {tab === "upload" && <UploadPanel />}
+        {tab === "retrieve" && <RetrievePanel />}
+        {tab === "verify" && <VerifyPanel />}
+      </div>
 
-        <div className="mt-10 text-[11px] text-gray-500 max-w-3xl">
-          <div className="font-semibold text-gray-400 mb-2">Notes</div>
-          <ul className="list-disc pl-5 space-y-1">
-            <li>
-              Retrieval shows the <span className="text-gray-300">latest</span>{" "}
-              version using the contract’s
-              <code className="mx-1">latest(fileId)</code> and{" "}
-              <code className="mx-1">versionsCount(fileId)</code>. If your ABI
-              exposes a per-index getter, you can extend this screen to list the
-              entire history.
-            </li>
-            <li>
-              Verification compares a local/remote file to on-chain metadata:
-              SHA-256 digest, size, and URL binding (by checking{" "}
-              <code className="mx-1">keccak256(url)</code> equals the stored{" "}
-              <code className="mx-1">uriHash</code>).
-            </li>
-            <li>
-              After upload, the IPFS gateway URL is saved in{" "}
-              <code className="mx-1">localStorage</code> for convenience under
-              <code className="mx-1">fileregistry:urls</code>. You can paste a
-              URL manually if needed.
-            </li>
-            <li>
-              EIP-712 signature is validated by the contract during{" "}
-              <code className="mx-1">register</code>. If you also store the
-              signature on-chain or emit it in an event, you can add off-chain
-              signature re-verification here.
-            </li>
-          </ul>
-        </div>
-      </main>
+      <div className="mt-10 text-[11px] text-gray-500 max-w-3xl">
+        <div className="font-semibold text-gray-400 mb-2">Notes</div>
+        <ul className="list-disc pl-5 space-y-1">
+          <li>
+            Retrieval shows the <span className="text-gray-300">latest</span>{" "}
+            version using the contract's
+            <code className="mx-1">latest(fileId)</code> and{" "}
+            <code className="mx-1">versionsCount(fileId)</code>. If your ABI
+            exposes a per-index getter, you can extend this screen to list the
+            entire history.
+          </li>
+          <li>
+            Verification compares a local/remote file to on‑chain metadata:
+            SHA‑256 digest, size, and URL binding (by checking{" "}
+            <code className="mx-1">keccak256(url)</code> equals the stored{" "}
+            <code className="mx-1">uriHash</code>).
+          </li>
+          <li>
+            After upload, the IPFS gateway URL is saved in{" "}
+            <code className="mx-1">localStorage</code> for convenience under
+            <code className="mx-1">fileregistry:urls</code>. You can paste a URL
+            manually if needed.
+          </li>
+          <li>
+            EIP‑712 signature is validated by the contract during{" "}
+            <code className="mx-1">register</code>. If you also store the
+            signature on‑chain or emit it in an event, you can add off‑chain
+            signature re‑verification here.
+          </li>
+        </ul>
+      </div>
     </div>
   );
 }
